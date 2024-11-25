@@ -3,9 +3,12 @@ import cv2
 import yaml
 import numpy as np
 import os
-from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox, QGraphicsScene
-from PyQt5.QtGui import QImage, QPixmap, QIcon
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QFileDialog, QMessageBox, QGraphicsScene,
+    QGraphicsEllipseItem, QGraphicsItem, QGraphicsView
+)
+from PyQt5.QtGui import QImage, QPixmap, QIcon, QBrush, QColor
+from PyQt5.QtCore import QTimer, Qt, QPointF
 from pathlib import Path
 from gui8 import Ui_MainWindow
 
@@ -51,12 +54,13 @@ class Processing:
         self.margin = margin
 
         # Puntos de origen y destino para la transformación de perspectiva
-        self.src = np.float32([
+        self.default_src = np.float32([
             [200, 720],
             [1100, 720],
             [595, 450],
             [685, 450]
         ])
+        self.src = self.default_src.copy()
         self.dst = np.float32([
             [300, 720],
             [980, 720],
@@ -71,7 +75,10 @@ class Processing:
         warped = cv2.warpPerspective(img, M, img_size, flags=cv2.INTER_LINEAR)
         return warped, Minv
 
-    def fit_polynomial(self, original_img, binary_warped, Minv, draw_windows=False, fill_lane=True):
+    def fit_polynomial(self, binary_warped, draw_windows=False):
+        # Asegurar que binary_warped es de tipo uint8
+        binary_warped = binary_warped.astype(np.uint8)
+
         # Tomar el histograma del tercio inferior de la imagen
         histogram = np.sum(binary_warped[binary_warped.shape[0]//2:, :], axis=0)
 
@@ -110,9 +117,9 @@ class Processing:
             # Dibujar ventanas
             if draw_windows:
                 cv2.rectangle(out_img, (win_xleft_low, win_y_low),
-                              (win_xleft_high, win_y_high), (255, 0, 0), 2)
+                              (win_xleft_high, win_y_high), (0, 255, 0), 2)
                 cv2.rectangle(out_img, (win_xright_low, win_y_low),
-                              (win_xright_high, win_y_high), (255, 0, 0), 2)
+                              (win_xright_high, win_y_high), (0, 255, 0), 2)
 
             # Identificar los píxeles no cero en x e y dentro de la ventana
             good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
@@ -142,10 +149,8 @@ class Processing:
         righty = nonzeroy[right_lane_inds]
 
         # Verificar si se encontraron píxeles suficientes para ajustar una línea
-        detection_successful = True
         if len(leftx) == 0 or len(lefty) == 0 or len(rightx) == 0 or len(righty) == 0:
-            detection_successful = False
-            return original_img, detection_successful, None, None, None, out_img
+            return None, None, None, None, None, out_img
 
         # Ajustar una curva polinomial de segundo grado
         left_fit = np.polyfit(lefty, leftx, 2)
@@ -160,37 +165,17 @@ class Processing:
             left_fitx = ploty * 0
             right_fitx = ploty * 0
 
-        # Dibujar las líneas detectadas en la imagen de salida
+        # Dibujar los píxeles detectados de las líneas en la imagen de salida
         out_img[nonzeroy[left_lane_inds], nonzerox[left_lane_inds]] = [255, 0, 0]
         out_img[nonzeroy[right_lane_inds], nonzerox[right_lane_inds]] = [0, 0, 255]
 
-        # Crear una imagen en blanco para dibujar las líneas
-        warp_zero = np.zeros_like(binary_warped).astype(np.uint8)
-        color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
-
-        # Reconvertir los puntos x e y en formato usable para cv2.fillPoly()
-        pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))])
-        pts_right = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty])))])
-        pts = np.hstack((pts_left, pts_right))
-
-        if fill_lane:
-            # Dibujar el área entre las líneas
-            cv2.fillPoly(color_warp, np.int_([pts]), (0, 255, 0))
-        else:
-            # Dibujar las líneas izquierda y derecha por separado
-            cv2.polylines(color_warp, np.int32([pts_left]), isClosed=False, color=(255, 0, 0), thickness=10)  # Rojo
-            cv2.polylines(color_warp, np.int32([pts_right]), isClosed=False, color=(0, 0, 255), thickness=10)  # Azul
-
-        # Volver a transformar la imagen al espacio original
-        newwarp = cv2.warpPerspective(color_warp, Minv, (original_img.shape[1], original_img.shape[0]))
-        # Combinar la imagen original con la imagen de las líneas detectadas
-        result = cv2.addWeighted(original_img, 1, newwarp, 0.3, 0)
-
-        # Si se dibujan las ventanas, superponerlas en la imagen de resultado
+        # Dibujar las líneas polinomiales si draw_windows es True
         if draw_windows:
-            result = cv2.addWeighted(result, 1, out_img, 0.3, 0)
+            for index in range(len(left_fitx)):
+                cv2.circle(out_img, (int(left_fitx[index]), int(ploty[index])), 2, (255, 255, 0), -1)
+                cv2.circle(out_img, (int(right_fitx[index]), int(ploty[index])), 2, (255, 255, 0), -1)
 
-        return result, detection_successful, left_fitx, right_fitx, ploty, out_img
+        return left_fitx, right_fitx, ploty, left_fit, right_fit, out_img
 
 class AlertGeneration:
     def __init__(self, min_lane_width_ratio=0.4, max_lane_width_ratio=0.8,
@@ -200,8 +185,7 @@ class AlertGeneration:
         self.max_center_offset_ratio = max_center_offset_ratio
         self.departure_threshold_pixels = departure_threshold_pixels
 
-    def is_valid_lane_detection(self, left_fitx, right_fitx, ploty, img_width, img_height,
-                                left_detected, right_detected):
+    def is_valid_lane_detection(self, left_fitx, right_fitx, ploty, img_width, img_height):
         # Calcular el ancho del carril en la base de la imagen
         if left_fitx is not None and right_fitx is not None:
             lane_width_pixels = right_fitx[-1] - left_fitx[-1]
@@ -224,25 +208,64 @@ class AlertGeneration:
         else:
             return False
 
-    def calculate_lane_departure(self, img, left_fitx, right_fitx, ploty):
-        img_width = img.shape[1]
-        img_height = img.shape[0]
-
+    def detect_lane_departure(self, left_fitx, right_fitx, ploty, img_width):
         # Calcular el centro del carril
         lane_center = (left_fitx[-1] + right_fitx[-1]) / 2
         vehicle_center = img_width / 2
         center_offset_pixels = lane_center - vehicle_center
 
-        # Dibujar el desplazamiento en la imagen
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        text = f'Deviation: {center_offset_pixels:.2f} pixels'
-        cv2.putText(img, text, (50, 50), font, 1, (255, 255, 255), 2, cv2.LINE_AA)
+        # Determinar si hay desviación hacia la izquierda o derecha
+        deviation = center_offset_pixels
 
-        # Generar alerta si se supera el umbral
-        if abs(center_offset_pixels) > self.departure_threshold_pixels:
-            cv2.putText(img, 'Lane Departure Alert!', (50, 100), font, 1, (0, 0, 255), 3, cv2.LINE_AA)
+        # Definir umbral para considerar desviación significativa
+        threshold = self.departure_threshold_pixels
 
-        return img
+        # Inicializar colores de las líneas
+        color_left = (255, 0, 0)  # Azul en BGR
+        color_right = (255, 0, 0)  # Azul en BGR
+
+        # Si hay desviación, cambiar el color del lado correspondiente a rojo
+        if deviation > threshold:
+            # Desviación hacia la izquierda (vehículo se acerca al carril derecho)
+            color_right = (0, 0, 255)  # Rojo
+        elif deviation < -threshold:
+            # Desviación hacia la derecha (vehículo se acerca al carril izquierdo)
+            color_left = (0, 0, 255)  # Rojo
+
+        return color_left, color_right
+
+class DraggablePoint(QGraphicsEllipseItem):
+    def __init__(self, x, y, index, parent=None):
+        super().__init__(-5, -5, 10, 10, parent)
+        self.setBrush(QBrush(Qt.red))
+        self.setFlags(
+            QGraphicsItem.ItemIsMovable |
+            QGraphicsItem.ItemIsSelectable |
+            QGraphicsItem.ItemSendsScenePositionChanges
+        )
+        self.setAcceptHoverEvents(True)
+        self.setCursor(Qt.OpenHandCursor)
+        self.setPos(x, y)
+        self.index = index  # Índice del punto (0 a 3)
+        self.setZValue(1)  # Asegura que los puntos estén sobre la imagen
+
+    def mousePressEvent(self, event):
+        self.setCursor(Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.setCursor(Qt.OpenHandCursor)
+        super().mouseReleaseEvent(event)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionChange and self.scene():
+            # Restringir el movimiento dentro de la escena
+            new_pos = value
+            rect = self.scene().sceneRect()
+            new_x = min(max(new_pos.x(), rect.left()), rect.right())
+            new_y = min(max(new_pos.y(), rect.top()), rect.bottom())
+            return QPointF(new_x, new_y)
+        return super().itemChange(change, value)
 
 class MainWindow(QMainWindow, Ui_MainWindow):
     def __init__(self):
@@ -270,9 +293,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             'SobelButton': 'Sobel',
             'fullPreButton': 'fullPre',
             'warpButton': 'warp',
-            'slidingWindowButton': 'window',
+            'slidingWindowButton': 'slidingWindow',
             'resultantButton': 'resultant',
         }
+
+        # Atributo para manejar el pixmap
+        self.pixmap_item = None
 
         # Cargar configuración
         self.load_config()
@@ -296,7 +322,29 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.slidingWindowButton.toggled.connect(self.update_debug_mode)
         self.resultantButton.toggled.connect(self.update_debug_mode)
 
-    # Función para cargar la configuración desde settings.yaml
+        # Nuevos checkboxes
+        self.supervisionBox.stateChanged.connect(self.update_supervision_mode)
+        self.shSupervisionBox.stateChanged.connect(self.update_sh_supervision_mode)
+        self.visualThreshBox.stateChanged.connect(self.update_visual_thresh_mode)
+        self.editCheck.stateChanged.connect(self.toggle_edit_mode)  # Conectar el checkbox de edición
+
+        # Configurar el QGraphicsView
+        self.graphicsView.setDragMode(QGraphicsView.NoDrag)
+        self.graphicsView.setFocusPolicy(Qt.StrongFocus)
+
+        # Estados iniciales
+        self.supervision_enabled = True
+        self.sh_supervision_enabled = False
+        self.visual_thresh_enabled = False
+        self.edit_mode = False
+
+        # Puntos de edición
+        self.edit_points = []
+        self.current_frame = None  # Para almacenar el frame actual
+
+        # Iniciar en mainTab por defecto
+        self.tabs.setCurrentIndex(0)
+
     def load_config(self):
         config_file = 'settings.yaml'
         try:
@@ -317,7 +365,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Actualizar la GUI con los valores de configuración
         self.update_gui_from_config()
 
-    # Función para verificar y actualizar la configuración
     def check_and_update_config(self):
         config_changed = False
 
@@ -383,7 +430,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         return config_changed
 
-    # Función para actualizar la GUI con los valores de configuración
     def update_gui_from_config(self):
         # Actualizar los campos de dataAcq
         self.picEdit.setText(self.config['dataAcq']['picSource'])
@@ -428,7 +474,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.toggleVisionIcon(self.visualBox.checkState())
         self.toggleSoundIcon(self.soundBox.checkState())
 
-    # Función para guardar la configuración en settings.yaml
     def save_config(self):
         config_file = 'settings.yaml'
         try:
@@ -437,7 +482,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error al guardar el archivo de configuración: {e}")
 
-    # Función para iniciar la reproducción de video
     def start_video(self):
         data_source = self.config['dataAcq']['dataSource']
         if data_source == "Video":
@@ -460,19 +504,26 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Actualiza las clases de procesamiento con los valores actuales
         self.update_processing_classes()
 
-    # Función para detener la reproducción de video
     def stop_video(self):
         if self.cap is not None:
             self.cap.release()
             self.cap = None
         self.timer.stop()
+        # Remover puntos de edición si existen
+        if self.edit_points:
+            for point in self.edit_points:
+                if point.scene():
+                    self.scene.removeItem(point)
+            self.edit_points = []
+        # Limpiar la escena y el pixmap_item
         self.scene.clear()
+        self.pixmap_item = None
+        self.edit_mode = False
+        self.editCheck.setChecked(False)
 
-    # Función para volver a la pestaña principal
     def go_to_main_tab(self):
         self.tabs.setCurrentIndex(0)
 
-    # Función para explorar y cargar una imagen
     def picFileDialog(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Seleccionar Imagen", "", "Archivos de imagen (*.jpg *.png *.jpeg)")
         if filename:
@@ -493,6 +544,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 if img is not None:
                     # Actualiza las clases de procesamiento con los valores actuales
                     self.update_processing_classes()
+                    self.current_frame = img.copy()
                     processed_img = self.lane_detection_pipeline(img)
                     self.display_image(processed_img)
                 else:
@@ -500,7 +552,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Error al cargar la imagen: {e}")
 
-    # Función para explorar y cargar un video
     def vidFileDialog(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Seleccionar Video", "", "Archivos de video (*.mp4 *.mpeg *.avi)")
         if filename:
@@ -592,13 +643,17 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         else:
             return "Unknown"
 
-    # Función para actualizar el frame del video
     def update_frame(self):
         if self.cap is not None and self.cap.isOpened():
+            # Si el modo de edición está activo, no actualizar el frame
+            if self.edit_mode:
+                return
+
             ret, frame = self.cap.read()
             if ret:
                 # Actualiza las clases de procesamiento con los valores actuales
                 self.update_processing_classes()
+                self.current_frame = frame.copy()
                 processed_frame = self.lane_detection_pipeline(frame)
                 self.display_image(processed_frame)
             else:
@@ -616,6 +671,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 bytes_per_line = width
                 q_img = QImage(img.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
             else:
+                # Asegurar que img es de tipo uint8
+                if img.dtype != np.uint8:
+                    img = img.astype(np.uint8)
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 height, width, channel = img.shape
                 bytes_per_line = 3 * width
@@ -624,13 +682,36 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
             pixmap = QPixmap.fromImage(q_img)
 
-            self.scene.clear()
-            self.scene.addPixmap(pixmap)
+            if self.pixmap_item is None:
+                self.pixmap_item = self.scene.addPixmap(pixmap)
+                self.pixmap_item.setZValue(0)  # Asegurar que la imagen está detrás de los puntos
+            else:
+                self.pixmap_item.setPixmap(pixmap)
+
+            # Establecer el tamaño de la escena al tamaño de la imagen
+            self.scene.setSceneRect(0, 0, width, height)
+
+            # Si está en modo edición, agregar los puntos
+            if self.edit_mode:
+                self.add_edit_points()
+
             self.graphicsView.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error en display_image: {e}")
 
-    # Función para actualizar las clases de procesamiento con los valores actuales
+    def add_edit_points(self):
+        # Solo agregar los puntos si no están ya agregados
+        if not self.edit_points:
+            # Agregar puntos interactivos
+            for i, (x, y) in enumerate(self.processing.src):
+                point = DraggablePoint(x, y, i)
+                self.edit_points.append(point)
+                self.scene.addItem(point)
+        else:
+            # Actualizar posiciones de los puntos existentes
+            for i, point in enumerate(self.edit_points):
+                point.setPos(*self.processing.src[i])
+
     def update_processing_classes(self):
         # Valores de preprocesamiento
         s_thresh = (
@@ -646,7 +727,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Valores de procesamiento
         nwindows = self.config['proConf']['nWindows']
         margin = self.config['proConf']['margin']
-        self.processing = Processing(nwindows, margin)
+        if not hasattr(self, 'processing') or self.processing is None:
+            self.processing = Processing(nwindows, margin)
+        else:
+            # Mantener los puntos src existentes
+            self.processing.nwindows = nwindows
+            self.processing.margin = margin
 
         # Valores de alerta
         min_lane_width_ratio = self.config['proConf']['laneWidth']['minimum']
@@ -656,7 +742,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.alert_generation = AlertGeneration(min_lane_width_ratio, max_lane_width_ratio,
                                                 max_center_offset_ratio, departure_threshold_pixels)
 
-    # Función para actualizar el modo de depuración
     def update_debug_mode(self):
         for key in self.debug_modes.keys():
             radio_button = getattr(self, key)
@@ -666,7 +751,40 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         else:
             self.debug_mode = 'fullButton'  # Valor por defecto
 
-    # Función principal del pipeline de detección de carril
+    def update_supervision_mode(self, state):
+        self.supervision_enabled = (state == Qt.Checked)
+
+    def update_sh_supervision_mode(self, state):
+        self.sh_supervision_enabled = (state == Qt.Checked)
+
+    def update_visual_thresh_mode(self, state):
+        self.visual_thresh_enabled = (state == Qt.Checked)
+
+    def toggle_edit_mode(self, state):
+        self.edit_mode = (state == Qt.Checked)
+        if self.edit_mode:
+            # Detener la actualización de frames mientras se edita
+            self.timer.stop()
+            # Mostrar la imagen con los puntos
+            if self.current_frame is not None:
+                self.display_image(self.current_frame)
+        else:
+            # Obtener las posiciones actuales de los puntos y actualizar src
+            if self.edit_points:
+                new_src = []
+                for point in self.edit_points:
+                    pos = point.pos()
+                    new_src.append([pos.x(), pos.y()])
+                self.processing.src = np.float32(new_src)
+                # Remover puntos de la escena
+                for point in self.edit_points:
+                    if point.scene():
+                        self.scene.removeItem(point)
+                self.edit_points = []
+            # Reanudar la actualización de frames
+            if self.cap is not None:
+                self.timer.start(30)
+
     def lane_detection_pipeline(self, frame):
         try:
             if self.preprocessing is None or self.processing is None or self.alert_generation is None:
@@ -685,71 +803,105 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             elif debug_mode == 'Sobel':
                 # Mostrar la imagen después del filtro Sobel
                 return cv2.cvtColor(sxbinary * 255, cv2.COLOR_GRAY2BGR)
-            elif debug_mode == 'fullPre':
-                # Mostrar la combinación de HSL y Sobel
-                combined_binary = np.zeros_like(s_binary)
-                combined_binary[(s_binary == 1) | (sxbinary == 1)] = 255
-                return cv2.cvtColor(combined_binary, cv2.COLOR_GRAY2BGR)
             else:
                 # Continuar con el pipeline
                 combined_binary = np.zeros_like(s_binary)
                 combined_binary[(s_binary == 1) | (sxbinary == 1)] = 255
 
+            if debug_mode == 'fullPre':
+                # Mostrar la combinación de HSL y Sobel
+                return cv2.cvtColor(combined_binary, cv2.COLOR_GRAY2BGR)
+
             # Transformación de perspectiva
             warped, Minv = self.processing.perspective_transform(combined_binary)
 
             if debug_mode == 'warp':
-                return cv2.cvtColor(warped * 255, cv2.COLOR_GRAY2BGR)
+                return cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
 
             # Detección y ajuste de carriles
-            draw_windows = (debug_mode == 'window')
-            fill_lane = False if debug_mode == 'fullCode' else True
+            draw_windows = (debug_mode == 'slidingWindow')
 
-            if debug_mode == 'window':
-                original_img = cv2.cvtColor(warped * 255, cv2.COLOR_GRAY2BGR)
-            else:
-                original_img = frame
+            left_fitx, right_fitx, ploty, left_fit, right_fit, out_img = self.processing.fit_polynomial(
+                warped, draw_windows=draw_windows)
 
-            result, detection_successful, left_fitx, right_fitx, ploty, out_img = self.processing.fit_polynomial(
-                original_img, warped, Minv, draw_windows=draw_windows, fill_lane=fill_lane)
+            if debug_mode == 'slidingWindow':
+                # Aplicar la transformación inversa a out_img para mostrar en perspectiva original
+                newwarp = cv2.warpPerspective(out_img, Minv, (frame.shape[1], frame.shape[0]))
+                return newwarp
 
-            if debug_mode == 'window':
-                # Mostrar las ventanas de búsqueda superpuestas a 'warped'
-                return out_img
+            if left_fitx is None or right_fitx is None:
+                # No se detectaron carriles
+                if debug_mode == 'resultant':
+                    # En 'resultant', mostrar la imagen warpada sin líneas
+                    return cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+                else:
+                    return frame
 
-            if detection_successful and self.strict_validation:
+            if self.strict_validation and self.supervision_enabled:
                 detection_successful = self.alert_generation.is_valid_lane_detection(
-                    left_fitx, right_fitx, ploty, frame.shape[1], frame.shape[0],
-                    left_fitx is not None, right_fitx is not None)
-
-            if detection_successful:
-                result = self.alert_generation.calculate_lane_departure(result, left_fitx, right_fitx, ploty)
+                    left_fitx, right_fitx, ploty, frame.shape[1], frame.shape[0])
             else:
+                detection_successful = True
+
+            if not detection_successful:
                 # No se detectó un carril válido
-                result = frame  # O podrías mostrar un mensaje o una imagen diferente
+                if debug_mode == 'resultant':
+                    # En 'resultant', mostrar la imagen warpada sin líneas
+                    return cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+                else:
+                    return frame
+
+            # Crear una imagen en blanco para dibujar las líneas
+            warp_zero = np.zeros_like(warped).astype(np.uint8)
+            color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
+
+            # Preparar los puntos para las líneas
+            pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))])
+            pts_right = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty])))])
+            pts = np.hstack((pts_left, pts_right))
 
             if debug_mode == 'resultant':
-                # Fondo negro y mostrar la línea detectada en verde y el centro en morado
-                lane_img = np.zeros_like(result)
-                if left_fitx is not None and right_fitx is not None:
-                    pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))])
-                    pts_right = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty])))])
-                    pts = np.hstack((pts_left, pts_right))
-                    cv2.fillPoly(lane_img, np.int_([pts]), (0, 255, 0))  # Verde
+                # Dibujar las líneas en color azul sin considerar la alerta de salida
+                cv2.polylines(color_warp, np.int32([pts_left]), isClosed=False, color=(255, 0, 0), thickness=20)
+                cv2.polylines(color_warp, np.int32([pts_right]), isClosed=False, color=(255, 0, 0), thickness=20)
 
-                    # Dibujar el centro en morado
-                    center_fitx = (left_fitx + right_fitx) / 2
-                    pts_center = np.array([np.transpose(np.vstack([center_fitx, ploty]))])
-                    cv2.polylines(lane_img, np.int32([pts_center]), isClosed=False, color=(255, 0, 255), thickness=10)  # Morado
+                # Agregar visualización de supervisión si está habilitada
+                if self.sh_supervision_enabled:
+                    lane_width_min = self.alert_generation.min_lane_width_ratio * frame.shape[1]
+                    lane_width_max = self.alert_generation.max_lane_width_ratio * frame.shape[1]
+                    # Dibujar líneas verticales para visualizar los umbrales
+                    left_boundary = (frame.shape[1] - lane_width_max) / 2
+                    right_boundary = frame.shape[1] - left_boundary
+                    cv2.line(color_warp, (int(left_boundary), 0), (int(left_boundary), frame.shape[0]), (255, 0, 255), 5)
+                    cv2.line(color_warp, (int(right_boundary), 0), (int(right_boundary), frame.shape[0]), (255, 0, 255), 5)
 
-                return lane_img
+                # Agregar visualización de umbrales de salida si está habilitada
+                if self.visual_thresh_enabled:
+                    departure_threshold = self.alert_generation.departure_threshold_pixels
+                    # Dibujar líneas verticales para visualizar los umbrales de salida
+                    center = frame.shape[1] / 2
+                    cv2.line(color_warp, (int(center - departure_threshold), 0),
+                             (int(center - departure_threshold), frame.shape[0]), (0, 255, 255), 5)
+                    cv2.line(color_warp, (int(center + departure_threshold), 0),
+                             (int(center + departure_threshold), frame.shape[0]), (0, 255, 255), 5)
 
-            if debug_mode == 'fullCode':
-                # Mostrar el resultado final con líneas independientes y validación estricta
+                return color_warp
+            else:
+                # Obtener los colores para las líneas considerando la desviación
+                color_left, color_right = self.alert_generation.detect_lane_departure(
+                    left_fitx, right_fitx, ploty, frame.shape[1])
+
+                # Dibujar las líneas en color_warp
+                cv2.polylines(color_warp, np.int32([pts_left]), isClosed=False, color=color_left, thickness=20)
+                cv2.polylines(color_warp, np.int32([pts_right]), isClosed=False, color=color_right, thickness=20)
+
+                # Aplicar la transformación inversa a color_warp
+                newwarp = cv2.warpPerspective(color_warp, Minv, (frame.shape[1], frame.shape[0]))
+
+                # Superponer las líneas en la imagen original
+                result = cv2.addWeighted(frame, 1, newwarp, 1, 0)
+
                 return result
-
-            # Si no se cumple ninguna condición, devolvemos el frame original
-            return frame
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error en lane_detection_pipeline: {e}")

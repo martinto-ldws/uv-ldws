@@ -1,0 +1,30 @@
+alertConf:
+  soundAlert: 'OFF'
+  visualAlert: 'ON'
+dataAcq:
+  dataSource: Video
+  picSource: ''
+  vidSource: C:\Users\xello\Downloads\guiv18\guiv18\ideal.mp4
+debugConf:
+  HSLButton: false
+  SobelButton: false
+  fullButton: true
+  fullPreButton: false
+  resultantButton: false
+  slidingWindowButton: false
+  warpButton: false
+preproConf:
+  SChannelThreshold:
+    maximum: 255
+    minimum: 170
+  SobelThreshold:
+    maximum: 100
+    minimum: 20
+proConf:
+  departureThreshold: 50
+  laneWidth:
+    maximum: 0.8
+    minimum: 0.4
+  margin: 100
+  maxCenterOffset: 0.1
+  nWindows: 9
